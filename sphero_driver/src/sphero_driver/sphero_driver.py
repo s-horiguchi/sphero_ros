@@ -32,11 +32,14 @@
 #author: Melonee Wise
 
 import bluetooth
+import serial
 import sys
 import struct
 import time
 import operator
 import threading
+import traceback
+import termios
 
 #These are the message response code that can be return by Sphero.
 MRSP = dict(
@@ -159,6 +162,30 @@ STRM_MASK2 = dict(
   VELOCITY_Y         = 0x00800000)
 
 
+class RFCOMMInterface(object):
+  def __init__(self, target_name="Sphero", target_addr="/dev/rfcomm0", baudrate=115200):
+    self.target_name = target_name
+    self.target_address = target_addr
+    self.baudrate = baudrate
+    self.sock = None
+    self.found_device = False
+
+  def connect(self):
+    print "opeing", self.target_address
+    self.sock = serial.Serial(self.target_address, self.baudrate)
+    return True
+
+  def close(self):
+    termios.tcflush(self.sock, termios.TCIOFLUSH)
+    self.sock.close()
+
+  def send(self, data):
+    self.sock.write(data)
+
+  def recv(self, num_bytes):
+    return self.sock.read(num_bytes)
+  
+  
 class BTInterface(object):
 
   def __init__(self, target_name = 'Sphero', target_addr = None, port = 1):
@@ -195,18 +222,22 @@ class BTInterface(object):
         else:
           sys.stdout.write("\nNo Sphero devices found.\n" )
           sys.stdout.flush()
-          sys.exit(1)
+          #sys.exit(1)
+          return False
     else:
-        sys.stdout.write("Connecting to device: " + self.target_address + "...")
+        sys.stdout.write("Connecting to specified device: " + self.target_address + "...")
 
     try:
       self.sock=bluetooth.BluetoothSocket(bluetooth.RFCOMM)
       self.sock.connect((self.target_address,self.port))
     except bluetooth.btcommon.BluetoothError as error:
-      sys.stdout.write(error.strerror)
-      sys.stdout.flush()
+      print
+      print "BluetoothError:", error
+      #sys.stdout.write(error.strerror)
+      #sys.stdout.flush()
       time.sleep(5.0)
-      sys.exit(1)
+      #sys.exit(1)
+      return False
     sys.stdout.write("Paired with Sphero.\n")
     sys.stdout.flush()
     return True
@@ -218,6 +249,7 @@ class BTInterface(object):
     return self.sock.recv(num_bytes)
 
   def close(self):
+    #termios.tcflush(self.sock, termios.TCIOFLUSH)
     self.sock.close()
 
 class Sphero(threading.Thread):
@@ -240,9 +272,10 @@ class Sphero(threading.Thread):
     self._sync_callback_queue = []
 
   def connect(self):
-    self.bt = BTInterface(self.target_name, self.target_address)
+    self.bt = RFCOMMInterface(self.target_name, self.target_address)
+    #self.bt = BTInterface(self.target_name, self.target_address)
     self.is_connected = self.bt.connect()
-    return True
+    return self.is_connected
 
   def inc_seq(self):
     self.seq = self.seq + 1
@@ -806,6 +839,8 @@ class Sphero(threading.Thread):
         self.raw_data_buf += self.bt.recv(num_bytes)
       data = self.raw_data_buf
       while len(data)>5:
+        if data[0] == "\x0d" and data[1:3] == RECV['SYNC']:
+          data = data[1:]
         if data[:2] == RECV['SYNC']:
           #print "got response packet"
           # response packet
@@ -826,15 +861,29 @@ class Sphero(threading.Thread):
             # the remainder of the packet isn't long enough
             break
           if data_packet[2]==IDCODE['DATA_STRM'] and self._async_callback_dict.has_key(IDCODE['DATA_STRM']):
-            self._async_callback_dict[IDCODE['DATA_STRM']](self.parse_data_strm(data_packet, data_length))
+            try:
+              self._async_callback_dict[IDCODE['DATA_STRM']](self.parse_data_strm(data_packet, data_length))
+            except:
+              traceback.print_exc()
           elif data_packet[2]==IDCODE['COLLISION'] and self._async_callback_dict.has_key(IDCODE['COLLISION']):
-            self._async_callback_dict[IDCODE['COLLISION']](self.parse_collision_detect(data_packet, data_length))
+            try:
+              self._async_callback_dict[IDCODE['COLLISION']](self.parse_collision_detect(data_packet, data_length))
+            except:
+              traceback.print_exc()
           elif data_packet[2]==IDCODE['PWR_NOTIFY'] and self._async_callback_dict.has_key(IDCODE['PWR_NOTIFY']):
-            self._async_callback_dict[IDCODE['PWR_NOTIFY']](self.parse_pwr_notify(data_packet, data_length))
+            try:
+              self._async_callback_dict[IDCODE['PWR_NOTIFY']](self.parse_pwr_notify(data_packet, data_length))
+            except:
+              traceback.print_exc()
           else:
             print "got a packet that isn't streaming: " + self.data2hexstr(data)
         else:
-          raise RuntimeError("Bad SOF : " + self.data2hexstr(data))
+          print "Bad SOF : " + self.data2hexstr(data)
+          time.sleep(5.0)
+          self.disconnect()
+          print "reconnecting...."
+          self.connect()
+          #raise RuntimeError("Bad SOF : " + self.data2hexstr(data))
       self.raw_data_buf=data
 
   def parse_pwr_notify(self, data, data_length):
